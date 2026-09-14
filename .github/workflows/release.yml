@@ -99,5 +99,6 @@ jobs:
           debug symbols.
           EOF
           gh release create "$GITHUB_REF_NAME" dist/* \
+            -R "$GITHUB_REPOSITORY" \
             --title "Relay $GITHUB_REF_NAME" \
             --notes-file /tmp/notes.md
