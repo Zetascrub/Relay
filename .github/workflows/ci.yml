@@ -23,5 +23,8 @@ jobs:
           persist-credentials: false
       - name: Use disposable CI trust stand-in (unprovisioned example build)
         run: cp config/generated_trust.ci.h main/generated_trust.h
-      - run: idf.py set-target esp32p4
-      - run: idf.py build
+      # GitHub Actions container jobs bypass this image's ENTRYPOINT (which is
+      # what normally activates the IDF environment), so idf.py isn't on PATH
+      # until export.sh is sourced explicitly in each step that needs it.
+      - run: . "$IDF_PATH/export.sh" && idf.py set-target esp32p4
+      - run: . "$IDF_PATH/export.sh" && idf.py build
