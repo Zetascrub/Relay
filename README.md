@@ -1,6 +1,25 @@
+<div align="center">
+
+<img src="assets/zeta.png" alt="Zeta, the Reconclave mascot" width="140">
+
 # Relay
 
+### Wired in. Always ready. Built to cooperate.
+
+[![Hardware](https://img.shields.io/badge/hardware-Unit_PoE--P4-0e222e?style=flat-square)](#build)
+[![Build](https://img.shields.io/badge/build-ESP--IDF-00cdd7?style=flat-square)](#build)
+[![Status](https://img.shields.io/badge/status-development_preview-ffaa1c?style=flat-square)](#firmware-capabilities)
+[![Family](https://img.shields.io/badge/family-Reconclave-fff2d7?style=flat-square)](https://github.com/Zetascrub/Reconclave)
+
 **The wired, always-on Reconclave execution node for M5Stack Unit PoE-P4.**
+
+[Reconclave](https://github.com/Zetascrub/Reconclave) ·
+[ZetaDongle](https://github.com/Zetascrub/ZetaDongle) ·
+[FieldDeck](https://github.com/Zetascrub/FieldDeck) ·
+[Sightline](https://github.com/Zetascrub/Sightline) ·
+[Command](https://github.com/Zetascrub/Reconclave-Command)
+
+</div>
 
 Relay is a focused Ethernet appliance for network discovery, bounded checks,
 and delegated automation. Its primary role is to extend a trusted Reconclave
@@ -70,7 +89,6 @@ workspace, then copy the Relay header into this repository:
 cd ../Reconclave
 python3 tools/provision_fleet.py --desktop-id rc-desktop-example \
   --p4-id rc-p4-example --cardputer-id rc-adv-example
-cp devices/poe-p4/main/generated_trust.h ../Relay/main/generated_trust.h
 cd ../Relay
 ```
 

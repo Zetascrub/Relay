@@ -2,10 +2,10 @@
 
 Copyright (c) 2026 Zetascrub. All rights reserved.
 
-The Zeta mascot artwork, logos and their generated pixel representations are
-excluded from the MIT licence for Reconclave's code and documentation. This
-includes the image files in `devices/cardputer-adv/assets/` and generated image
-data in `devices/cardputer-adv/src/assets/`.
+The Zeta mascot artwork, logos, README images, and generated pixel
+representations are excluded from the MIT licence for Reconclave-family code
+and documentation. This includes files named `zeta*.png`, related artwork under
+`assets/`, and source-code representations derived from those images.
 
 The code licence does not grant permission to reuse, modify, redistribute or
 use these assets as branding. Contact Zetascrub for permission before doing so.
