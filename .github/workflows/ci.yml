@@ -1,0 +1,13 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  source-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: test ! -e main/generated_trust.h
+      - run: python3 -m json.tool dependencies.lock >/dev/null

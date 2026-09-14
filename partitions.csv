@@ -1,0 +1,12 @@
+# Reconclave PoE-P4 partition table -- two OTA app slots plus otadata, so
+# `fleet.ota.apply` (main.c) always writes to the *inactive* slot and only ever
+# switches the boot pointer after the streamed artifact's SHA-256 has been verified.
+# Replaces the stock single-app table (Phase 4 gap: this board previously had no
+# OTA-capable partition layout at all). Sized against ESPTOOLPY_FLASHSIZE_16MB.
+#
+# Name,     Type, SubType,  Offset,   Size,  Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  3M,
+ota_1,      app,  ota_1,    ,         3M,

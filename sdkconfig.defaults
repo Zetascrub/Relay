@@ -1,0 +1,37 @@
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LWIP_MAX_SOCKETS=12
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Two-OTA-slot partition table + bootloader rollback safety net for `fleet.ota.apply`
+# (main.c). Without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, esp_ota_set_boot_partition
+# commits to the new image immediately with no automatic revert if it crash-loops.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_APP_ROLLBACK_ENABLE=y
+
+# Found by actually flashing this to real hardware: raising the main task stack alone
+# (kept below with real headroom, since it's cheap and the default is tight once fleet.ota
+# and the encrypted outbox are linked in) does NOT fix it -- see CONFIG_ESP_SYSTEM_HW_STACK_GUARD
+# below, which is the actual fix.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Real hardware (ESP32-P4, chip revision v1.3 / ECO2, i.e. preliminary pre-v3.0 silicon)
+# panics on every boot with "Guru Meditation Error: Core 0 panic'ed (Stack protection
+# fault)" in the "main" task, always trapping inside stock ESP-IDF flash/cache HAL code
+# (efuse_hal_chip_revision(), called from spi_flash's cache_hal_suspend() path) before a
+# single line of this project's own code runs -- and the assist-debug peripheral's
+# reported stack bounds stayed a suspicious, unchanged ~4KB regardless of
+# CONFIG_ESP_MAIN_TASK_STACK_SIZE (confirmed via a real rebuild+reflash: raising it to
+# 8192 alone reproduced the identical crash byte-for-byte). That signature -- a HW guard
+# trip only ever inside flash/cache/efuse internals on preliminary P4 silicon, ignoring
+# the configured stack size -- matches a HW stack-guard false positive on early P4
+# revisions rather than a genuine overflow. Disabling the assist-debug peripheral's SP
+# monitor fixed it: confirmed booting cleanly and staying up (mDNS + HTTP announce both
+# reachable) with this set. Software stack-overflow protection for our own tasks still
+# applies via the FreeRTOS canary checks; this only turns off the hardware SP-range trap.
+CONFIG_ESP_SYSTEM_HW_STACK_GUARD=n
