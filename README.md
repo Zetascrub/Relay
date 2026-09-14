@@ -93,8 +93,9 @@ cd ../Relay
 ```
 
 See [fleet trust](https://github.com/Zetascrub/Reconclave/blob/main/docs/trust-architecture.md). Keep the store and generated
-headers private. Built images contain deployment keys and are not public release
-artifacts; see [release signing](https://github.com/Zetascrub/Reconclave/blob/main/docs/releasing.md).
+headers private. Built images with a real provisioned header contain deployment
+keys and are not public release artifacts; see
+[release signing](https://github.com/Zetascrub/Reconclave/blob/main/docs/releasing.md).
 
 Activate ESP-IDF 5.4.2, then run:
 
@@ -102,6 +103,12 @@ Activate ESP-IDF 5.4.2, then run:
 idf.py set-target esp32p4
 idf.py build
 ```
+
+Pushing a version tag (`vX.Y.Z`) runs [release.yml](.github/workflows/release.yml),
+which builds against the disposable `config/generated_trust.ci.h` stand-in (the
+same one CI uses) and publishes that as a GitHub Release — an **unprovisioned
+example build** you flash and then provision for real, not a deployable fleet
+image. See [docs/releasing.md](https://github.com/Zetascrub/Reconclave/blob/main/docs/releasing.md#public-example-firmware-dummy-trust-ci-builds).
 
 ## Flash
 

@@ -11,3 +11,17 @@ jobs:
           persist-credentials: false
       - run: test ! -e main/generated_trust.h
       - run: python3 -m json.tool dependencies.lock >/dev/null
+
+  firmware:
+    runs-on: ubuntu-latest
+    # Pinned by digest to dependencies.lock's `idf: version: 5.4.2`.
+    container:
+      image: espressif/idf@sha256:4317595a911886e04cbc6d731315d5fc2918e510b6733fc7d03381ab2d270082 # v5.4.2
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Use disposable CI trust stand-in (unprovisioned example build)
+        run: cp config/generated_trust.ci.h main/generated_trust.h
+      - run: idf.py set-target esp32p4
+      - run: idf.py build

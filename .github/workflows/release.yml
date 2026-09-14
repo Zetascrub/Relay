@@ -1,0 +1,95 @@
+name: Release
+
+# Tag-triggered example-firmware release. This does NOT build a deployable
+# fleet node: it compiles against config/generated_trust.ci.h, the disposable
+# all-zero CI trust stand-in ("never provision hardware with this file"), the
+# same fixture ci.yml uses for the firmware build check. The resulting binary
+# cannot authenticate against a real Reconclave fleet and its evidence-
+# encryption key is public knowledge, so it is safe to publish. It exists so
+# anyone can flash a Unit PoE-P4, see the base app boot and link Ethernet,
+# and then provision it for real with tools/provision_fleet.py from the
+# Reconclave repo. See
+# https://github.com/Zetascrub/Reconclave/blob/main/docs/releasing.md
+# ("Public example firmware" section) for the policy this implements.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Pinned by digest to dependencies.lock's `idf: version: 5.4.2`. gh CLI
+    # isn't in this image, so publishing happens in a separate, uncontainered
+    # job below.
+    container:
+      image: espressif/idf@sha256:4317595a911886e04cbc6d731315d5fc2918e510b6733fc7d03381ab2d270082 # v5.4.2
+    env:
+      ASSET_PREFIX: reconclave-relay
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Use disposable CI trust stand-in (unprovisioned example build)
+        run: cp config/generated_trust.ci.h main/generated_trust.h
+
+      - run: idf.py set-target esp32p4
+      - run: idf.py build
+      - name: Merge into a single flashable image
+        run: idf.py merge-bin -o merged-flash.bin
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          cp build/reconclave_poe_p4.bin  "dist/${ASSET_PREFIX}-${VERSION}-firmware.bin"
+          cp build/reconclave_poe_p4.elf  "dist/${ASSET_PREFIX}-${VERSION}-firmware.elf"
+          cp build/merged-flash.bin       "dist/${ASSET_PREFIX}-${VERSION}-merged-flash.bin"
+          ( cd dist && sha256sum -- * > SHA256SUMS )
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/notes.md <<'EOF'
+          **Unprovisioned example build.** Compiled against the disposable CI
+          trust stand-in (`config/generated_trust.ci.h`): all-zero HMAC and
+          storage keys, `ci-*` placeholder peer IDs. It will boot, bring up
+          Ethernet and advertise `_reconclave._tcp`, but it will NOT
+          authenticate against a real Reconclave fleet, and its
+          evidence-encryption key is public.
+
+          Flash it to verify the device, then provision real per-device trust
+          with `tools/provision_fleet.py` from the
+          [Reconclave](https://github.com/Zetascrub/Reconclave) repo before
+          deploying against a live coordinator. See
+          [docs/releasing.md](https://github.com/Zetascrub/Reconclave/blob/main/docs/releasing.md).
+
+          `merged-flash.bin` flashes in one shot at offset `0x0`
+          (`python -m esptool --chip esp32p4 write-flash 0x0 merged-flash.bin`).
+          `firmware.bin`/`firmware.elf` are the standalone app image and its
+          debug symbols.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Relay $GITHUB_REF_NAME" \
+            --notes-file /tmp/notes.md
