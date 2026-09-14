@@ -27,6 +27,11 @@ jobs:
     # job below.
     container:
       image: espressif/idf@sha256:4317595a911886e04cbc6d731315d5fc2918e510b6733fc7d03381ab2d270082 # v5.4.2
+    # Container jobs default to `sh`, not `bash`, which breaks `set -o pipefail`
+    # below (confirmed: "Illegal option -o pipefail" on the first real run).
+    defaults:
+      run:
+        shell: bash
     env:
       ASSET_PREFIX: reconclave-relay
     steps:

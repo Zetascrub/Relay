@@ -17,6 +17,11 @@ jobs:
     # Pinned by digest to dependencies.lock's `idf: version: 5.4.2`.
     container:
       image: espressif/idf@sha256:4317595a911886e04cbc6d731315d5fc2918e510b6733fc7d03381ab2d270082 # v5.4.2
+    # Container jobs default to `sh`, not `bash`; keep this consistent with
+    # release.yml's build job (which needs bash for `set -o pipefail`).
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
