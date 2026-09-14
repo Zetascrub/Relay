@@ -10,7 +10,12 @@ jobs:
         with:
           persist-credentials: false
       - run: test ! -e main/generated_trust.h
-      - run: python3 -m json.tool dependencies.lock >/dev/null
+      # dependencies.lock is YAML (ESP-IDF component manager lock format), not
+      # JSON — this was checking it with the wrong parser and had been failing
+      # on every run since it was added, unnoticed because nothing else in
+      # this job depended on the result.
+      - run: pip install --quiet pyyaml
+      - run: python3 -c "import yaml; yaml.safe_load(open('dependencies.lock'))"
 
   firmware:
     runs-on: ubuntu-latest
