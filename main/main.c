@@ -1,7 +1,10 @@
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -32,6 +35,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/etharp.h"
 #include "lwip/netdb.h"
+#include "lwip/sockets.h"
 #include "lwip/tcpip.h"
 #include "ping/ping_sock.h"
 #include "generated_trust.h"
@@ -68,6 +72,13 @@
 #define RC_SCAN_MAX_HOSTS 254
 #define RC_SCAN_MAX_RESULTS 48
 #define RC_SCAN_PING_TIMEOUT_MS 120
+#define RC_PORTSCAN_MAX_PORTS 32
+#define RC_PORTSCAN_SLOTS 8
+#define RC_PORTSCAN_MIN_TIMEOUT_MS 50
+#define RC_PORTSCAN_MAX_TIMEOUT_MS 1500
+#define RC_PORTSCAN_DEFAULT_TIMEOUT_MS 400
+#define RC_IDENTIFY_MAX_PORTS 16
+#define RC_IDENTIFY_BANNER_BYTES 192
 #define RC_RECUR_MIN_INTERVAL_MS 10000
 #define RC_RECUR_MAX_INTERVAL_MS 86400000
 #define RC_AUTOMATION_NAMESPACE "rc_auto"
@@ -1003,6 +1014,291 @@ static bool check_internet_possible(network_state_t state, bool *gateway_reachab
     return *gateway_reachable && *dns_resolved;
 }
 
+static cJSON *error_response(const char *destination, const char *request_id,
+                             const char *code, const char *message);
+
+// Parses a "target" IPv4 string and confirms it is a single host on this node's
+// directly attached /24, mirroring the restriction net.discovery.scan already
+// enforces. Returns the address in network byte order through ip_be.
+static bool parse_attached_target(const cJSON *arguments, uint32_t *ip_be)
+{
+    const cJSON *target = cJSON_GetObjectItemCaseSensitive(arguments, "target");
+    if (!cJSON_IsString(target)) return false;
+    unsigned ta, tb, tc, td, la, lb, lc, ld;
+    int end = 0;
+    if (sscanf(target->valuestring, "%u.%u.%u.%u%n", &ta, &tb, &tc, &td, &end) != 4 ||
+        end != (int)strlen(target->valuestring)) return false;
+    if (ta > 255 || tb > 255 || tc > 255 || td < 1 || td > 254) return false;
+    network_state_t state;
+    portENTER_CRITICAL(&s_lock);
+    state = s_network;
+    portEXIT_CRITICAL(&s_lock);
+    end = 0;
+    if (sscanf(state.ip, "%u.%u.%u.%u%n", &la, &lb, &lc, &ld, &end) != 4 ||
+        end != (int)strlen(state.ip) || ld > 255) return false;
+    if (ta != la || tb != lb || tc != lc) return false;
+    *ip_be = htonl((ta << 24) | (tb << 16) | (tc << 8) | td);
+    return true;
+}
+
+// Reads a bounded "ports" array of 1..65535 values into out, de-duplicating.
+// Returns the count, or 0 when the array is missing, empty, or malformed.
+static size_t parse_ports(const cJSON *arguments, uint16_t *out, size_t limit)
+{
+    const cJSON *ports = cJSON_GetObjectItemCaseSensitive(arguments, "ports");
+    if (!cJSON_IsArray(ports)) return 0;
+    size_t count = 0;
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, ports) {
+        if (count >= limit) return 0;
+        if (!cJSON_IsNumber(entry)) return 0;
+        const int value = entry->valueint;
+        if (value < 1 || value > 65535 || entry->valuedouble != (double)value) return 0;
+        bool duplicate = false;
+        for (size_t i = 0; i < count; ++i) if (out[i] == value) { duplicate = true; break; }
+        if (!duplicate) out[count++] = (uint16_t)value;
+    }
+    return count;
+}
+
+// Runs one wave of up to RC_PORTSCAN_SLOTS non-blocking TCP connects in parallel and
+// records which reached CONNECTED within timeout_ms. A refused or unreachable port and
+// a timed-out port both read as not-open; only a completed handshake counts as open.
+static void scan_port_wave(uint32_t ip_be, const uint16_t *ports, size_t count,
+                           bool *open_out, int timeout_ms)
+{
+    int fds[RC_PORTSCAN_SLOTS];
+    bool pending[RC_PORTSCAN_SLOTS];
+    for (size_t i = 0; i < count; ++i) {
+        open_out[i] = false;
+        pending[i] = false;
+        fds[i] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fds[i] < 0) continue;
+        const int flags = fcntl(fds[i], F_GETFL, 0);
+        if (flags < 0 || fcntl(fds[i], F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(fds[i]);
+            fds[i] = -1;
+            continue;
+        }
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(ports[i]);
+        addr.sin_addr.s_addr = ip_be;
+        const int result = connect(fds[i], (struct sockaddr *)&addr, sizeof(addr));
+        if (result == 0) {
+            open_out[i] = true;
+            close(fds[i]);
+            fds[i] = -1;
+        } else if (errno == EINPROGRESS) {
+            pending[i] = true;
+        } else {
+            close(fds[i]);
+            fds[i] = -1;
+        }
+    }
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        fd_set write_set, except_set;
+        FD_ZERO(&write_set);
+        FD_ZERO(&except_set);
+        int max_fd = -1;
+        bool any_pending = false;
+        for (size_t i = 0; i < count; ++i) {
+            if (!pending[i]) continue;
+            FD_SET(fds[i], &write_set);
+            FD_SET(fds[i], &except_set);
+            if (fds[i] > max_fd) max_fd = fds[i];
+            any_pending = true;
+        }
+        const int64_t now = esp_timer_get_time();
+        if (!any_pending || now >= deadline) break;
+        const int64_t remaining = deadline - now;
+        struct timeval tv = {.tv_sec = remaining / 1000000, .tv_usec = remaining % 1000000};
+        if (select(max_fd + 1, NULL, &write_set, &except_set, &tv) <= 0) break;
+        for (size_t i = 0; i < count; ++i) {
+            if (!pending[i] ||
+                (!FD_ISSET(fds[i], &write_set) && !FD_ISSET(fds[i], &except_set))) continue;
+            int error = 0;
+            socklen_t length = sizeof(error);
+            open_out[i] = getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &error, &length) == 0 &&
+                          error == 0;
+            close(fds[i]);
+            fds[i] = -1;
+            pending[i] = false;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) if (pending[i]) close(fds[i]);
+}
+
+static cJSON *port_scan_response(const char *destination, const char *request_id,
+                                 const cJSON *arguments)
+{
+    uint32_t ip_be = 0;
+    uint16_t ports[RC_PORTSCAN_MAX_PORTS];
+    const size_t count = parse_ports(arguments, ports, RC_PORTSCAN_MAX_PORTS);
+    if (!parse_attached_target(arguments, &ip_be)) {
+        return error_response(destination, request_id, "INVALID_ARGUMENT",
+                              "target must be a host on the node's attached /24");
+    }
+    if (count == 0) {
+        return error_response(destination, request_id, "INVALID_ARGUMENT",
+                              "ports must be 1 to 32 values in 1..65535");
+    }
+    const cJSON *timeout_json = cJSON_GetObjectItemCaseSensitive(arguments, "timeout_ms");
+    int timeout_ms = cJSON_IsNumber(timeout_json) ? timeout_json->valueint :
+        RC_PORTSCAN_DEFAULT_TIMEOUT_MS;
+    if (timeout_ms < RC_PORTSCAN_MIN_TIMEOUT_MS) timeout_ms = RC_PORTSCAN_MIN_TIMEOUT_MS;
+    if (timeout_ms > RC_PORTSCAN_MAX_TIMEOUT_MS) timeout_ms = RC_PORTSCAN_MAX_TIMEOUT_MS;
+
+    cJSON *root = new_envelope("response", destination);
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "request_id", request_id);
+    cJSON_AddStringToObject(payload, "status", "ok");
+    cJSON *result = cJSON_AddObjectToObject(payload, "result");
+    const cJSON *target = cJSON_GetObjectItemCaseSensitive(arguments, "target");
+    cJSON_AddStringToObject(result, "target", target->valuestring);
+    cJSON_AddNumberToObject(result, "total", count);
+    cJSON_AddNumberToObject(result, "checked", count);
+    cJSON *open = cJSON_AddArrayToObject(result, "open");
+    for (size_t offset = 0; offset < count; offset += RC_PORTSCAN_SLOTS) {
+        const size_t wave = count - offset < RC_PORTSCAN_SLOTS ? count - offset :
+            RC_PORTSCAN_SLOTS;
+        bool open_flags[RC_PORTSCAN_SLOTS];
+        scan_port_wave(ip_be, ports + offset, wave, open_flags, timeout_ms);
+        for (size_t i = 0; i < wave; ++i) {
+            if (open_flags[i]) cJSON_AddItemToArray(open, cJSON_CreateNumber(ports[offset + i]));
+        }
+    }
+    cJSON_AddNumberToObject(result, "open_count", cJSON_GetArraySize(open));
+    return root;
+}
+
+static const char *guess_service(uint16_t port)
+{
+    switch (port) {
+    case 21: return "ftp";
+    case 22: return "ssh";
+    case 23: return "telnet";
+    case 25: return "smtp";
+    case 53: return "dns";
+    case 80: case 8080: case 8000: return "http";
+    case 110: return "pop3";
+    case 143: return "imap";
+    case 443: case 8443: return "https";
+    case 445: return "smb";
+    case 554: return "rtsp";
+    case 1883: return "mqtt";
+    case 3306: return "mysql";
+    case 3389: return "rdp";
+    case 5432: return "postgresql";
+    case 5900: return "vnc";
+    case 8765: return "reconclave";
+    default: return "unknown";
+    }
+}
+
+// Opens a single blocking-with-timeout TCP connection, reads any greeting banner (after a
+// generic HTTP probe for web ports), and returns a sanitised one-line banner. Used by
+// net.service.identify. No protocol-specific exploitation -- it only reads what the
+// service volunteers.
+static void identify_one(uint32_t ip_be, uint16_t port, int timeout_ms, char *banner,
+                         size_t banner_size, bool *connected)
+{
+    banner[0] = '\0';
+    *connected = false;
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) return;
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(fd);
+        return;
+    }
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = ip_be;
+    const int result = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (result != 0 && errno == EINPROGRESS) {
+        fd_set write_set;
+        FD_ZERO(&write_set);
+        FD_SET(fd, &write_set);
+        struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (select(fd + 1, NULL, &write_set, NULL, &tv) <= 0 ||
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
+            close(fd);
+            return;
+        }
+    } else if (result != 0) {
+        close(fd);
+        return;
+    }
+    *connected = true;
+    // A nonblocking recv would return EWOULDBLOCK before greeting banners arrive.
+    fcntl(fd, F_SETFL, flags);
+    struct timeval rcv = {.tv_sec = 0, .tv_usec = 300000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
+    const char *service = guess_service(port);
+    if (strcmp(service, "http") == 0) {
+        const char *probe = "HEAD / HTTP/1.0\r\n\r\n";
+        send(fd, probe, strlen(probe), 0);
+    }
+    char raw[RC_IDENTIFY_BANNER_BYTES + 1];
+    const int received = recv(fd, raw, RC_IDENTIFY_BANNER_BYTES, 0);
+    close(fd);
+    if (received <= 0) return;
+    size_t out = 0;
+    for (int i = 0; i < received && out + 1 < banner_size; ++i) {
+        const unsigned char c = (unsigned char)raw[i];
+        if (c == '\r' || c == '\n') break;  // first line only
+        if (c >= 32 && c < 127) banner[out++] = (char)c;
+    }
+    banner[out] = '\0';
+}
+
+static cJSON *service_identify_response(const char *destination, const char *request_id,
+                                        const cJSON *arguments)
+{
+    uint32_t ip_be = 0;
+    uint16_t ports[RC_IDENTIFY_MAX_PORTS];
+    const size_t count = parse_ports(arguments, ports, RC_IDENTIFY_MAX_PORTS);
+    if (!parse_attached_target(arguments, &ip_be)) {
+        return error_response(destination, request_id, "INVALID_ARGUMENT",
+                              "target must be a host on the node's attached /24");
+    }
+    if (count == 0) {
+        return error_response(destination, request_id, "INVALID_ARGUMENT",
+                              "ports must be 1 to 16 values in 1..65535");
+    }
+    const cJSON *timeout_json = cJSON_GetObjectItemCaseSensitive(arguments, "timeout_ms");
+    int timeout_ms = cJSON_IsNumber(timeout_json) ? timeout_json->valueint :
+        RC_PORTSCAN_DEFAULT_TIMEOUT_MS;
+    if (timeout_ms < RC_PORTSCAN_MIN_TIMEOUT_MS) timeout_ms = RC_PORTSCAN_MIN_TIMEOUT_MS;
+    if (timeout_ms > RC_PORTSCAN_MAX_TIMEOUT_MS) timeout_ms = RC_PORTSCAN_MAX_TIMEOUT_MS;
+
+    cJSON *root = new_envelope("response", destination);
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "request_id", request_id);
+    cJSON_AddStringToObject(payload, "status", "ok");
+    cJSON *result = cJSON_AddObjectToObject(payload, "result");
+    const cJSON *target = cJSON_GetObjectItemCaseSensitive(arguments, "target");
+    cJSON_AddStringToObject(result, "target", target->valuestring);
+    cJSON *services = cJSON_AddArrayToObject(result, "services");
+    for (size_t i = 0; i < count; ++i) {
+        char banner[RC_IDENTIFY_BANNER_BYTES + 1];
+        bool connected = false;
+        identify_one(ip_be, ports[i], timeout_ms, banner, sizeof(banner), &connected);
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddNumberToObject(entry, "port", ports[i]);
+        cJSON_AddBoolToObject(entry, "connected", connected);
+        cJSON_AddStringToObject(entry, "service", guess_service(ports[i]));
+        cJSON_AddStringToObject(entry, "banner", banner);
+        cJSON_AddItemToArray(services, entry);
+    }
+    return root;
+}
+
 static cJSON *connectivity_response(const char *destination, const char *request_id)
 {
     network_state_t state;
@@ -1279,6 +1575,8 @@ static cJSON *announcement(void)
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("coordination.job.cancel"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.connectivity.check"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.arp.snapshot"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.tcp.connect"));
+    cJSON_AddItemToArray(capabilities, cJSON_CreateString("net.service.identify"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("automation.rule.put"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("automation.rule.list"));
     cJSON_AddItemToArray(capabilities, cJSON_CreateString("automation.rule.delete"));
@@ -1290,21 +1588,32 @@ static cJSON *announcement(void)
                          "coordination.job.cancel", "net.connectivity.check",
                          "net.arp.snapshot", "automation.rule.put", "automation.rule.list",
                          "automation.rule.delete", "evidence.outbox.read", "evidence.outbox.ack",
-                         "fleet.ota.apply"};
+                         "fleet.ota.apply", "net.tcp.connect", "net.service.identify"};
     for (size_t index = 0; index < sizeof(ids) / sizeof(ids[0]); ++index) {
         cJSON *descriptor = cJSON_CreateObject();
         cJSON_AddStringToObject(descriptor, "id", ids[index]);
         cJSON_AddNumberToObject(descriptor, "version", 1);
         cJSON_AddStringToObject(descriptor, "permission", "trusted");
         cJSON *features = cJSON_AddArrayToObject(descriptor, "features");
-        if (index == 1) {
+        if (strcmp(ids[index], "net.discovery.scan") == 0) {
             cJSON_AddItemToArray(features, cJSON_CreateString("ipv4"));
             cJSON_AddItemToArray(features, cJSON_CreateString("range"));
             cJSON_AddItemToArray(features, cJSON_CreateString("recurring"));
             cJSON_AddItemToArray(features, cJSON_CreateString("after-completion"));
+        } else if (strcmp(ids[index], "net.tcp.connect") == 0) {
+            cJSON_AddItemToArray(features, cJSON_CreateString("ipv4"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("scope-required"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("bounded-ports"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("bounded-timeout"));
+        } else if (strcmp(ids[index], "net.service.identify") == 0) {
+            cJSON_AddItemToArray(features, cJSON_CreateString("ipv4"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("scope-required"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("bounded-ports"));
+            cJSON_AddItemToArray(features, cJSON_CreateString("passive-banner"));
         }
         cJSON *limits = cJSON_AddObjectToObject(descriptor, "limits");
-        cJSON_AddNumberToObject(limits, "weight", index == 1 ? 2 : 1);
+        cJSON_AddNumberToObject(limits, "weight",
+                                strcmp(ids[index], "net.discovery.scan") == 0 ? 2 : 1);
         cJSON_AddNumberToObject(limits, "max_concurrency", 1);
         cJSON_AddItemToArray(descriptors, descriptor);
     }
@@ -1651,9 +1960,12 @@ static bool scope_network_authorised(const cJSON *included, const cJSON *exclude
 // tokens). Absolute freshness is still covered by the outer request's boot-nonce-bound
 // replay protection, which already prevents an old signed request -- token included --
 // from being resent after this device reboots or replayed within the same boot session.
-static bool scope_delegation_valid(const cJSON *arguments, const char *capability,
+#define RC_CANON_TEXT_BYTES 4096
+
+static bool scope_delegation_check(const cJSON *arguments, const char *capability,
                                    const rc_provisioned_peer_t *peer, const char *device_id,
-                                   const char **error_code, const char **error_message)
+                                   const char **error_code, const char **error_message,
+                                   char *unsigned_text, char *original_text)
 {
     const cJSON *token = cJSON_GetObjectItemCaseSensitive(arguments, "_scope_delegation");
     if (peer == NULL || !cJSON_IsObject(token)) {
@@ -1669,8 +1981,7 @@ static bool scope_delegation_valid(const cJSON *arguments, const char *capabilit
         *error_message = "scope delegation signature is invalid";
         return false;
     }
-    char unsigned_text[4096];
-    canon_buf_t unsigned_buf = {unsigned_text, sizeof(unsigned_text), 0, false};
+    canon_buf_t unsigned_buf = {unsigned_text, RC_CANON_TEXT_BYTES, 0, false};
     if (!canonical_json(token, &unsigned_buf, "tag")) {
         *error_code = "SCOPE_INVALID";
         *error_message = "scope delegation could not be canonicalised";
@@ -1689,8 +2000,7 @@ static bool scope_delegation_valid(const cJSON *arguments, const char *capabilit
         *error_message = "scope delegation does not match this operation";
         return false;
     }
-    char original_text[4096];
-    canon_buf_t original_buf = {original_text, sizeof(original_text), 0, false};
+    canon_buf_t original_buf = {original_text, RC_CANON_TEXT_BYTES, 0, false};
     if (!canonical_json(arguments, &original_buf, "_scope_delegation")) {
         *error_code = "SCOPE_INVALID";
         *error_message = "scope delegation could not be canonicalised";
@@ -1713,16 +2023,51 @@ static bool scope_delegation_valid(const cJSON *arguments, const char *capabilit
         *error_message = "scope delegation has an invalid lifetime";
         return false;
     }
+    // net.discovery.scan carries a "network" CIDR; net.tcp.connect carries a single
+    // "target" host, which is scoped as a /32 when it has no explicit prefix.
     const cJSON *network_json = cJSON_GetObjectItemCaseSensitive(arguments, "network");
-    if (!cJSON_IsString(network_json) ||
-        !scope_network_authorised(cJSON_GetObjectItemCaseSensitive(token, "included_networks"),
+    const cJSON *target_json = cJSON_GetObjectItemCaseSensitive(arguments, "target");
+    const cJSON *scoped = cJSON_IsString(network_json) ? network_json : target_json;
+    char target_text[24];
+    if (!cJSON_IsString(scoped) || strlen(scoped->valuestring) >= sizeof(target_text)) {
+        *error_code = "SCOPE_INVALID";
+        *error_message = "operation contains no explicit target";
+        return false;
+    }
+    if (strchr(scoped->valuestring, '/') != NULL) {
+        snprintf(target_text, sizeof(target_text), "%s", scoped->valuestring);
+    } else {
+        snprintf(target_text, sizeof(target_text), "%s/32", scoped->valuestring);
+    }
+    if (!scope_network_authorised(cJSON_GetObjectItemCaseSensitive(token, "included_networks"),
                                   cJSON_GetObjectItemCaseSensitive(token, "excluded_networks"),
-                                  network_json->valuestring)) {
+                                  target_text)) {
         *error_code = "SCOPE_DENIED";
         *error_message = "target is outside delegated scope";
         return false;
     }
     return true;
+}
+
+// The two canonical-text buffers live on the heap: together they are as large as the
+// whole httpd task stack, and holding them there overflowed it into the heap.
+static bool scope_delegation_valid(const cJSON *arguments, const char *capability,
+                                   const rc_provisioned_peer_t *peer, const char *device_id,
+                                   const char **error_code, const char **error_message)
+{
+    char *unsigned_text = malloc(RC_CANON_TEXT_BYTES);
+    char *original_text = malloc(RC_CANON_TEXT_BYTES);
+    bool valid = false;
+    if (unsigned_text == NULL || original_text == NULL) {
+        *error_code = "RESOURCE_EXHAUSTED";
+        *error_message = "scope delegation could not be checked";
+    } else {
+        valid = scope_delegation_check(arguments, capability, peer, device_id, error_code,
+                                       error_message, unsigned_text, original_text);
+    }
+    free(unsigned_text);
+    free(original_text);
+    return valid;
 }
 
 static bool sha256_hex_is_valid(const char *value)
@@ -1986,6 +2331,20 @@ static esp_err_t message_handler(httpd_req_t *request)
             response = error_response(source_id, id, scope_error_code, scope_error_message);
         } else {
             response = scan_response(source_id, id, true, arguments);
+            response_status = "ok";
+        }
+    } else if (json_string_equals(capability, "net.tcp.connect") ||
+               json_string_equals(capability, "net.service.identify")) {
+        const char *scope_error_code = NULL;
+        const char *scope_error_message = NULL;
+        if (!scope_delegation_valid(arguments, capability->valuestring, authenticated_peer,
+                                    s_device_id, &scope_error_code, &scope_error_message)) {
+            response = error_response(source_id, id, scope_error_code, scope_error_message);
+        } else if (json_string_equals(capability, "net.tcp.connect")) {
+            response = port_scan_response(source_id, id, arguments);
+            response_status = "ok";
+        } else {
+            response = service_identify_response(source_id, id, arguments);
             response_status = "ok";
         }
     } else if (json_string_equals(capability, "coordination.job.status")) {
